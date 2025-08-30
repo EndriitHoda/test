@@ -1,0 +1,5 @@
+simulator/node_modules/
+data/
+.idea/
+simulator/.DS_Store
+jars_dir/cache

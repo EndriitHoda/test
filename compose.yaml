@@ -1,0 +1,191 @@
+version: '3.8'
+
+networks:
+  kafka-spark:
+    name: kafka-spark
+    driver: bridge
+
+services:
+#region Data pipeline services
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - ./data/zookeeper/data:/var/lib/zookeeper/data
+      - ./data/zookeeper/log:/var/lib/zookeeper/log
+    ports:
+      - "2181:2181"
+    networks:
+      - kafka-spark
+
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    container_name: kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    volumes:
+      - ./data/kafka_data:/var/lib/kafka/data
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: 'zookeeper:2181'
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    networks:
+      - kafka-spark
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server=localhost:9092", "--list"]
+      interval: 5s
+      retries: 5
+
+  spark-master:
+    container_name: spark
+    image: bitnami/spark:3.4.1
+    environment:
+      - SPARK_MODE=master
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+    networks:
+      - kafka-spark
+    volumes:
+      - ./jars_dir:/opt/bitnami/spark/ivy:z
+    ports:
+      - "7077:7077"
+      - "8080:8080"  # Spark master UI
+
+  spark-worker:
+    container_name: spark-worker
+    image: bitnami/spark:3.4.1
+    depends_on:
+      - spark-master
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark:7077
+      - SPARK_WORKER_MEMORY=1G
+      - SPARK_WORKER_CORES=1
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+    ports:
+      - "8081:8081"  # Spark worker UI
+    networks:
+      - kafka-spark
+
+  spark-app:
+   container_name: spark-app
+   build:
+     context: spark
+   env_file:
+      - .env
+   environment:
+     - HOME=/tmp
+     - HADOOP_USER_NAME=spark_user
+   volumes:
+     - ./jars_dir:/opt/bitnami/spark/.ivy2:z
+   depends_on:
+    cassandra:
+      condition: service_started
+    mongodb:
+      condition: service_started
+    kafka:
+      condition: service_healthy
+   networks:
+      - kafka-spark
+
+  cassandra:
+    container_name: cassandra
+    image: cassandra:4.1
+    ports:
+      - "${CASSANDRA_PORT}:9042"
+    volumes:
+      - ./data/cassandra_data:/var/lib/cassandra
+    networks:
+      - kafka-spark
+
+  cassandra-init:
+    container_name: cassandra-init
+    image: cassandra:4.1
+    depends_on:
+      - cassandra
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      "sleep 30 &&
+      cqlsh cassandra 9042 -f /cassandra/init.cql"
+    volumes:
+      - ./cassandra/init.cql:/cassandra/init.cql:ro
+    networks:
+      - kafka-spark
+
+  mongodb:
+    container_name: mongodb
+    image: mongo:7
+    volumes:
+      - ./data/mongo_data:/data/db
+    ports:
+      - "27018:${MONGODB_PORT}"
+    networks:
+      - kafka-spark
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    ports:
+      - 9999:8080
+    environment:
+      DYNAMIC_CONFIG_ENABLED: true
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    networks:
+      - kafka-spark
+    depends_on:
+      - kafka
+
+#endregion
+
+#region Application services
+  gradle-builder:
+    build:
+      context: ./gradle-builder
+    image: gradle-builder:latest
+
+  simulator-frontend:
+    build:
+      context: simulator
+      dockerfile: Dockerfile
+    container_name: simulator-frontend
+    env_file:
+      - .env
+    ports:
+      - "${SIMULATOR_FRONTEND_PORT}:80"
+    restart: unless-stopped
+    depends_on:
+      - ingestor-backend
+
+  ingestor-backend:
+    build:
+      context: ingestor
+      dockerfile: Dockerfile
+    container_name: ingestor-backend
+    env_file:
+      - .env
+    ports:
+      - "${INGESTOR_BACKEND_PORT}:9009"
+    restart: unless-stopped
+    networks:
+      - kafka-spark
+    depends_on:
+      - gradle-builder
+      - kafka
+#endregion
